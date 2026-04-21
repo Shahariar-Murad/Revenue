@@ -589,8 +589,12 @@ with tab_confirmo:
             raw_bytes = confirmo_file.read()
             raw_text = raw_bytes.decode("utf-8-sig", errors="replace")
             raw_lines = raw_text.splitlines()
-            if raw_lines and raw_lines[0].strip().lower() == 'sep=,':
-                raw_text = "\n".join(raw_lines[1:])
+
+            if raw_lines:
+                first_line = raw_lines[0].strip().strip('"').strip("'").lower()
+                if first_line == 'sep=,':
+                    raw_text = "\n".join(raw_lines[1:])
+
             df_confirmo = pd.read_csv(io.StringIO(raw_text))
         else:
             df_confirmo = pd.read_excel(confirmo_file)
