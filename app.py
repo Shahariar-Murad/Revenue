@@ -582,67 +582,76 @@ with tab_confirmo:
     order_files_confirmo = st.file_uploader("Upload Order-list Files for Confirmo (Multiple files allowed)", key="order_files_confirmo", type=["csv", "xlsx"], accept_multiple_files=True)
 
     if confirmo_file and order_files_confirmo:
-        # Load Confirmo
+        st.subheader("Step 1: Load Confirmo File")
+
+        # Load Confirmo file and handle CSV files starting with sep=,
         if confirmo_file.name.lower().endswith('.csv'):
-            try:
-                df_confirmo = pd.read_csv(confirmo_file, skiprows=1)
-            except Exception:
-                confirmo_file.seek(0)
-                df_confirmo = pd.read_csv(confirmo_file)
-                if list(df_confirmo.columns) == ['sep=,']:
-                    confirmo_file.seek(0)
-                    df_confirmo = pd.read_csv(confirmo_file, skiprows=1)
+            raw_bytes = confirmo_file.read()
+            raw_text = raw_bytes.decode("utf-8-sig", errors="replace")
+            raw_lines = raw_text.splitlines()
+            if raw_lines and raw_lines[0].strip().lower() == 'sep=,':
+                raw_text = "\n".join(raw_lines[1:])
+            df_confirmo = pd.read_csv(io.StringIO(raw_text))
         else:
             df_confirmo = pd.read_excel(confirmo_file)
 
-        required_confirmo_cols = ["CreatedAt", "ID", "Reference", "Status", "MerchantAmount", "MerchantCurrency"]
+        required_confirmo_cols = ["CreatedAt", "ID", "Reference", "Status", "PaidAmount", "Customer-Settlement Rate"]
         missing_confirmo_cols = [col for col in required_confirmo_cols if col not in df_confirmo.columns]
         if missing_confirmo_cols:
             st.error(f"Confirmo file must contain these columns: {', '.join(missing_confirmo_cols)}. Found columns: {list(df_confirmo.columns)}")
             st.stop()
 
+        # Parse datetime and numeric columns
         df_confirmo["CreatedAt"] = pd.to_datetime(df_confirmo["CreatedAt"], format="%d.%m.%Y %H:%M:%S", errors="coerce")
-        if df_confirmo["CreatedAt"].isna().all():
-            st.error("Unable to parse Confirmo 'CreatedAt' values.")
-            st.stop()
+        numeric_cols_confirmo = ["PaidAmount", "Customer-Settlement Rate", "Credited", "MerchantAmount", "CustomerAmount"]
+        for col in numeric_cols_confirmo:
+            if col in df_confirmo.columns:
+                df_confirmo[col] = pd.to_numeric(df_confirmo[col], errors="coerce")
 
-        # Validate and filter Confirmo
-        df_confirmo = df_confirmo[
-            (df_confirmo["Status"].astype(str).str.upper() == "PAID") &
-            (df_confirmo["MerchantCurrency"].astype(str).str.upper() == "USD")
-        ].copy()
+        # Revenue logic: PaidAmount * Customer-Settlement Rate
+        df_confirmo["Calculated Revenue"] = df_confirmo["PaidAmount"] * df_confirmo["Customer-Settlement Rate"]
 
-        # Remove duplicates by invoice ID
+        # Keep only paid rows
         initial_confirmo_count = len(df_confirmo)
+        df_confirmo = df_confirmo[df_confirmo["Status"].astype(str).str.upper() == "PAID"].copy()
+        st.info(f"Filtered {initial_confirmo_count} → {len(df_confirmo)} transactions (Status=PAID)")
+
+        # Remove rows with invalid CreatedAt
+        invalid_created = df_confirmo["CreatedAt"].isna()
+        if invalid_created.any():
+            st.warning(f"Removed {invalid_created.sum()} rows with invalid CreatedAt")
+            df_confirmo = df_confirmo[~invalid_created].copy()
+
+        # Remove duplicates by ID
         duplicates_confirmo = df_confirmo.duplicated(subset=["ID"], keep=False)
         if duplicates_confirmo.any():
-            st.warning(f"Removed {duplicates_confirmo.sum()} duplicates from {initial_confirmo_count} Confirmo transactions")
+            st.warning(f"Removed {duplicates_confirmo.sum()} duplicates from Confirmo transactions")
             df_confirmo = df_confirmo.drop_duplicates(subset=["ID"], keep="first")
         st.info(f"Confirmo PSP: {len(df_confirmo)} clean transactions")
 
-        # Date range selection based on CreatedAt
-        min_date_confirmo = df_confirmo['CreatedAt'].dt.date.min()
-        max_date_confirmo = df_confirmo['CreatedAt'].dt.date.max()
-        col1_cf, col2_cf = st.columns(2)
-        with col1_cf:
+        # Date range selection
+        min_date_confirmo = df_confirmo["CreatedAt"].dt.date.min()
+        max_date_confirmo = df_confirmo["CreatedAt"].dt.date.max()
+        col1_conf, col2_conf = st.columns(2)
+        with col1_conf:
             start_date_confirmo = st.date_input("Start date", value=min_date_confirmo, key="confirmo_start_date")
-        with col2_cf:
+        with col2_conf:
             end_date_confirmo = st.date_input("End date", value=max_date_confirmo, key="confirmo_end_date")
 
-        # Filter Confirmo data for selected window (00:00 to 23:59:59)
-        start_confirmo = datetime.combine(start_date_confirmo, time(0, 0, 0))
-        end_confirmo = datetime.combine(end_date_confirmo, time(23, 59, 59))
-        df_confirmo = df_confirmo[(df_confirmo['CreatedAt'] >= start_confirmo) & (df_confirmo['CreatedAt'] <= end_confirmo)].copy()
+        # Filter Confirmo data for selected window
+        start_created_conf = datetime.combine(start_date_confirmo, time(0, 0, 0))
+        end_created_conf = datetime.combine(end_date_confirmo, time(23, 59, 59))
+        df_confirmo = df_confirmo[(df_confirmo["CreatedAt"] >= start_created_conf) & (df_confirmo["CreatedAt"] <= end_created_conf)].copy()
 
-        # Define Order List window with GMT+2 offset (same logic as BridgerPay/Coins Buy)
-        start_ord_confirmo = datetime.combine(start_date_confirmo, time(2, 0, 0))
-        end_ord_confirmo = datetime.combine(end_date_confirmo + timedelta(days=1), time(1, 59, 59))
+        # Order list window with GMT+2 offset
+        start_ord_conf = datetime.combine(start_date_confirmo, time(2, 0, 0))
+        end_ord_conf = datetime.combine(end_date_confirmo + timedelta(days=1), time(1, 59, 59))
 
         # Sort oldest→newest
         df_confirmo = df_confirmo.sort_values("CreatedAt")
 
         # Load and merge multiple Order-list files for Confirmo
-        st.subheader("Step 3: Process Confirmo Order List Files")
+        st.subheader("Step 2: Process Confirmo Order List Files")
         st.info(f"Processing {len(order_files_confirmo)} Order List file(s)")
 
         order_list_dfs = []
@@ -654,102 +663,117 @@ with tab_confirmo:
             st.info(f"File {i+1} ({order_file.name}): {len(df_temp)} entries")
             order_list_dfs.append(df_temp)
 
-        df_ord4 = pd.concat(order_list_dfs, ignore_index=True)
-        st.info(f"Combined Order List: {len(df_ord4)} total entries before cleaning")
+        df_ord_conf = pd.concat(order_list_dfs, ignore_index=True)
+        st.info(f"Combined Order List: {len(df_ord_conf)} total entries before cleaning")
 
-        if not all(g == "Confirmo" for g in df_ord4.get("Gateway", pd.Series()).dropna().unique()):
+        if "Gateway" not in df_ord_conf.columns:
+            st.error("Order-list file must contain 'Gateway' column.")
+            st.stop()
+
+        if not all(g == "Confirmo" for g in df_ord_conf.get("Gateway", pd.Series()).dropna().unique()):
             st.error("Order-list must have Gateway='Confirmo'")
             st.stop()
-        df_ord4 = df_ord4[df_ord4.get("Gateway", "") == "Confirmo"].copy()
+        df_ord_conf = df_ord_conf[df_ord_conf.get("Gateway", "") == "Confirmo"].copy()
 
-        duplicates_ord4 = df_ord4.duplicated(subset=["Transaction ID"], keep=False)
-        if duplicates_ord4.any():
-            st.warning(f"Removed {duplicates_ord4.sum()} duplicates from merged Order List")
-            df_ord4 = df_ord4.drop_duplicates(subset=["Transaction ID"], keep="first")
+        # Remove duplicates by Transaction ID
+        duplicates_ord_conf = df_ord_conf.duplicated(subset=["Transaction ID"], keep=False)
+        if duplicates_ord_conf.any():
+            st.warning(f"Removed {duplicates_ord_conf.sum()} duplicates from merged Order List")
+            df_ord_conf = df_ord_conf.drop_duplicates(subset=["Transaction ID"], keep="first")
 
-        df_ord4 = df_ord4.sort_values("Updated At")
-        st.success(f"Final merged Order List: {len(df_ord4)} clean entries (sorted by datetime)")
+        df_ord_conf = df_ord_conf.sort_values("Updated At")
+        st.success(f"Final merged Order List: {len(df_ord_conf)} clean entries (sorted by datetime)")
 
-        # Filter Order-list with GMT+2 offset window
-        df_ord4 = df_ord4[(df_ord4["Updated At"] >= start_ord_confirmo) & (df_ord4["Updated At"] <= end_ord_confirmo)].copy()
+        # Filter order-list by time window
+        df_ord_conf = df_ord_conf[(df_ord_conf["Updated At"] >= start_ord_conf) & (df_ord_conf["Updated At"] <= end_ord_conf)].copy()
 
-        # Match Confirmo invoice ID to Order-list Transaction ID
-        df_ord4_sel = df_ord4[["Transaction ID", "Tracking ID", "Plan Type", "Grand Total"]].copy()
-        df_merged4 = df_confirmo.merge(
-            df_ord4_sel,
+        # Match Confirmo ID with Transaction ID using previous logic
+        df_ord_conf_sel = df_ord_conf[["Transaction ID", "Plan Type", "Grand Total"]].copy()
+        df_merged_conf = df_confirmo.merge(
+            df_ord_conf_sel,
             left_on="ID",
             right_on="Transaction ID",
             how="inner"
         )
 
-        mask_amt4 = df_merged4["MerchantAmount"] != df_merged4["Grand Total"]
-        if mask_amt4.any():
-            st.warning(f"Found {mask_amt4.sum()} amount mismatches in Confirmo:")
-            st.dataframe(df_merged4.loc[mask_amt4, [
-                "ID", "Reference", "MerchantAmount", "Grand Total", "MerchantCurrency"
-            ]])
+        # Show comparison against order-list grand total using Calculated Revenue
+        mask_amt_conf = df_merged_conf["Calculated Revenue"].round(6) != pd.to_numeric(df_merged_conf["Grand Total"], errors="coerce").round(6)
+        if mask_amt_conf.any():
+            st.warning(f"Found {mask_amt_conf.sum()} amount mismatches in Confirmo:")
+            display_cols = ["ID", "PaidAmount", "Customer-Settlement Rate", "Calculated Revenue", "Grand Total"]
+            existing_display_cols = [col for col in display_cols if col in df_merged_conf.columns]
+            st.dataframe(df_merged_conf.loc[mask_amt_conf, existing_display_cols])
         else:
             st.success("No amount mismatches")
 
         # Handle unmatched PSP entries (add to CFD)
-        unmatched_confirmo_psp = df_confirmo[~df_confirmo["ID"].isin(df_merged4["ID"])]
+        unmatched_confirmo_psp = df_confirmo[~df_confirmo["ID"].isin(df_merged_conf["ID"])]
         if len(unmatched_confirmo_psp) > 0:
             st.warning(f"Found {len(unmatched_confirmo_psp)} unmatched Confirmo PSP entries - adding to CFD:")
-            st.dataframe(unmatched_confirmo_psp[["ID", "Reference", "CreatedAt", "MerchantAmount", "MerchantCurrency"]])
+            display_unmatched_cols = [col for col in ["ID", "Reference", "CreatedAt", "PaidAmount", "Customer-Settlement Rate", "Calculated Revenue"] if col in unmatched_confirmo_psp.columns]
+            st.dataframe(unmatched_confirmo_psp[display_unmatched_cols])
             unmatched_confirmo_psp = unmatched_confirmo_psp.copy()
             unmatched_confirmo_psp["Plan Type"] = "CFD (Unmatched PSP)"
-            unmatched_confirmo_psp["Grand Total"] = unmatched_confirmo_psp["MerchantAmount"]
-            df_merged4 = pd.concat([df_merged4, unmatched_confirmo_psp], ignore_index=True)
+            unmatched_confirmo_psp["Grand Total"] = unmatched_confirmo_psp["Calculated Revenue"]
+            df_merged_conf = pd.concat([df_merged_conf, unmatched_confirmo_psp], ignore_index=True)
 
-        st.info(f"Final total: {len(df_merged4)} transactions included in export")
+        st.info(f"Final total: {len(df_merged_conf)} transactions included in export")
 
         # Split into Futures vs CFD
-        df_futures4 = df_merged4[df_merged4["Plan Type"].apply(is_futures_plan)].copy()
-        df_cfd4 = df_merged4[~df_merged4["Plan Type"].apply(is_futures_plan)].copy()
+        df_futures_conf = df_merged_conf[df_merged_conf["Plan Type"].apply(is_futures_plan)].copy()
+        df_cfd_conf = df_merged_conf[~df_merged_conf["Plan Type"].apply(is_futures_plan)].copy()
 
         # Sort by datetime before export
-        df_futures4 = df_futures4.sort_values("CreatedAt")
-        df_cfd4 = df_cfd4.sort_values("CreatedAt")
+        df_futures_conf = df_futures_conf.sort_values("CreatedAt")
+        df_cfd_conf = df_cfd_conf.sort_values("CreatedAt")
 
         # Revenue summary (GMT+6 shift on CreatedAt)
-        df_futures4["Date"] = (df_futures4["CreatedAt"] + pd.Timedelta(hours=6)).dt.date
-        df_cfd4["Date"] = (df_cfd4["CreatedAt"] + pd.Timedelta(hours=6)).dt.date
-        df_futures4["Category"] = "Futures"
-        df_cfd4["Category"] = "CFD"
-        df_summary4 = pd.concat([
-            df_cfd4[["Date", "Category", "MerchantAmount"]],
-            df_futures4[["Date", "Category", "MerchantAmount"]]
+        df_futures_conf["Date"] = (df_futures_conf["CreatedAt"] + pd.Timedelta(hours=6)).dt.date
+        df_cfd_conf["Date"] = (df_cfd_conf["CreatedAt"] + pd.Timedelta(hours=6)).dt.date
+        df_futures_conf["Category"] = "Futures"
+        df_cfd_conf["Category"] = "CFD"
+
+        df_summary_conf = pd.concat([
+            df_cfd_conf[["Date", "Category", "Calculated Revenue"]],
+            df_futures_conf[["Date", "Category", "Calculated Revenue"]]
         ])
-        df_summary4 = df_summary4.groupby(["Date", "Category"], as_index=False).agg(Revenue=("MerchantAmount", "sum")).sort_values("Date")
+        df_summary_conf = df_summary_conf.groupby(["Date", "Category"], as_index=False).agg(Revenue=("Calculated Revenue", "sum")).sort_values("Date")
 
         st.subheader("Datewise Revenue Summary (GMT+6)")
-        st.dataframe(df_summary4)
+        st.dataframe(df_summary_conf)
 
         # Excel output for Confirmo
-        output4 = io.BytesIO()
-        with pd.ExcelWriter(output4, engine="xlsxwriter") as writer:
-            cols_confirmo = df_confirmo.columns.tolist()
-            df_cfd4[cols_confirmo].to_excel(writer, sheet_name='CFD', index=False)
-            df_futures4[cols_confirmo].to_excel(writer, sheet_name='Futures', index=False)
-            df_summary4.to_excel(writer, sheet_name='Revenue Summary', index=False)
-            for sheet_name, df_out in [('CFD', df_cfd4), ('Futures', df_futures4), ('Revenue Summary', df_summary4)]:
+        output_conf = io.BytesIO()
+        with pd.ExcelWriter(output_conf, engine="xlsxwriter") as writer:
+            cols_conf = df_confirmo.columns.tolist()
+            if "Calculated Revenue" not in cols_conf:
+                cols_conf.append("Calculated Revenue")
+            df_cfd_conf[cols_conf].to_excel(writer, sheet_name='CFD', index=False)
+            df_futures_conf[cols_conf].to_excel(writer, sheet_name='Futures', index=False)
+            df_summary_conf.to_excel(writer, sheet_name='Revenue Summary', index=False)
+
+            for sheet_name, df_out in [('CFD', df_cfd_conf[cols_conf]), ('Futures', df_futures_conf[cols_conf]), ('Revenue Summary', df_summary_conf)]:
                 ws = writer.sheets[sheet_name]
                 for idx, col in enumerate(df_out.columns):
-                    max_len = max(df_out[col].astype(str).map(len).max(), len(col)) + 2
+                    try:
+                        max_len = max(df_out[col].astype(str).map(len).max(), len(col)) + 2
+                    except Exception:
+                        max_len = len(col) + 2
                     ws.set_column(idx, idx, max_len)
 
         st.download_button(
             label="Download Confirmo Comparison Report",
-            data=output4.getvalue(),
+            data=output_conf.getvalue(),
             file_name="confirmo_order_comparison.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
         # Store in session state for Summary tab
-        st.session_state['confirmo_summary'] = df_summary4.copy()
+        st.session_state['confirmo_summary'] = df_summary_conf.copy()
         st.session_state['confirmo_summary']['Gateway'] = 'Confirmo'
     else:
         st.info("Please upload the Confirmo file and at least one Order-list file for Confirmo.")
+
 
 # --- PayProcc Tab ---
 with tab_payprocc:
@@ -891,7 +915,7 @@ with tab_payprocc:
 # --- Summary Tab ---
 with tab_summary:
     st.header("Combined Gateway Revenue Summary")
-    st.write("This tab shows the combined revenue summary from all five gateways.")
+    st.write("This tab shows the combined revenue summary from all available gateways.")
     
     # Collect summaries from session state
     summaries = []
